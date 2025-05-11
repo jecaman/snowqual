@@ -14,6 +14,9 @@ CREATE OR REPLACE TABLE CONTROL_DEFINITIONS (
   SOURCE_SCHEMA STRING,                                -- Esquema de tabla de referencia (para CONSISTENCY o FUNCTIONALITY)
   SOURCE_TABLE STRING,                                 -- Tabla de referencia (si aplica)
   COLUMNS_KEY STRING,                                  -- Lista de columnas clave o de control
+  CONSISTENCY_SOURCE_QUERY STRING,                     -- Query de origen definida por el usuario
+  CONSISTENCY_TARGET_QUERY STRING,                     -- Query de destino definida por el usuario
+  THRESHOLD_DIFF FLOAT DEFAULT 0.05                    -- Umbral de discrepancia permitido (porcentaje)
   WHERE_CLAUSE STRING,                                 -- Filtro opcional para delimitar el subconjunto de datos
   SCHEDULE STRING NOT NULL,                            -- Frecuencia de ejecución (por ejemplo, '15 MINUTE')
   IS_ACTIVE BOOLEAN DEFAULT TRUE,                      -- Estado del control (activo o inactivo)
@@ -111,26 +114,40 @@ $$;
 
 CREATE OR REPLACE PROCEDURE DROP_CHECK_PR(CHECK_ID STRING)
 RETURNS STRING
-LANGUAGE SQL
+LANGUAGE JAVASCRIPT
 AS
 $$
-DECLARE
-  CHECK_NAME STRING;
-BEGIN
-  -- Obtener el nombre de la task a partir del CHECK_ID
-  SELECT CHECK_NAME INTO CHECK_NAME
+var sql_command = `
+  SELECT CHECK_NAME
   FROM CONTROL_DEFINITIONS
-  WHERE CHECK_ID = :CHECK_ID;
+  WHERE CHECK_ID = ?;
+`;
+var stmt = snowflake.createStatement({sqlText: sql_command, binds: [CHECK_ID]});
+var result = stmt.execute();
 
-  -- Eliminar la task si existe
-  EXECUTE IMMEDIATE 'DROP TASK IF EXISTS IDENTIFIER(:1)' USING CHECK_NAME;
+if (!result.next()) {
+  return 'No se encontró el CHECK_ID: ' + CHECK_ID;
+}
 
-  -- Eliminar la fila del control
-  EXECUTE IMMEDIATE 'DELETE FROM CONTROL_DEFINITIONS WHERE CHECK_ID = :1' USING CHECK_ID;
+var check_name = result.getColumnValue(1);
 
-  RETURN 'Task eliminada y control borrado: ' || CHECK_NAME;
-END;
+// Eliminar la task si existe
+var drop_task = snowflake.createStatement({
+  sqlText: `DROP TASK IF EXISTS IDENTIFIER(?)`,
+  binds: [check_name]
+});
+drop_task.execute();
+
+// Eliminar la fila del control
+var delete_control = snowflake.createStatement({
+  sqlText: `DELETE FROM CONTROL_DEFINITIONS WHERE CHECK_ID = ?`,
+  binds: [CHECK_ID]
+});
+delete_control.execute();
+
+return 'Task eliminada y control borrado: ' + check_name;
 $$;
+
 
 
 
@@ -143,38 +160,44 @@ $$;
 
 CREATE OR REPLACE PROCEDURE CREATE_REPLACE_CHECK_PR(CHECK_ID STRING, CHECK_NAME STRING)
 RETURNS STRING
-LANGUAGE SQL
+LANGUAGE JAVASCRIPT
 AS
 $$
-DECLARE
-  check_type STRING;
-  mensaje STRING;
-BEGIN
-  -- Recuperamos el tipo de control a partir del ID
-  SELECT CHECK_TYPE INTO check_type
+var check_type_sql = `
+  SELECT CHECK_TYPE
   FROM CONTROL_DEFINITIONS
-  WHERE CHECK_ID = :CHECK_ID;
+  WHERE CHECK_ID = ?;
+`;
 
-  -- Enrutamos según el tipo de check
-  IF check_type = 'FRESHNESS' THEN
-    CALL CREATE_TASK_FRESHNESS(CHECK_ID);
-    LET mensaje = 'Task de tipo FRESHNESS creada';
+var stmt = snowflake.createStatement({sqlText: check_type_sql, binds: [CHECK_ID]});
+var rs = stmt.execute();
 
-  ELSIF check_type = 'UNIQUENESS' THEN
-    CALL CREATE_TASK_UNIQUENESS(CHECK_ID);
-    LET mensaje = 'Task de tipo UNIQUENESS creada';
+if (!rs.next()) {
+  return 'No se encontró el CHECK_ID: ' + CHECK_ID;
+}
 
-  ELSIF check_type = 'CONSISTENCY' THEN
-    CALL CREATE_TASK_CONSISTENCY(CHECK_ID);
-    LET mensaje = 'Task de tipo CONSISTENCY creada';
+var check_type = rs.getColumnValue(1);
+var mensaje = '';
 
-  ELSE
-    LET mensaje = 'Tipo de check no soportado: ' || check_type;
-  END IF;
+if (check_type === 'FRESHNESS') {
+  snowflake.execute({sqlText: `CALL CREATE_TASK_FRESHNESS(?)`, binds: [CHECK_ID]});
+  mensaje = 'Task de tipo FRESHNESS creada';
 
-  RETURN mensaje;
-END;
+} else if (check_type === 'UNIQUENESS') {
+  snowflake.execute({sqlText: `CALL CREATE_TASK_UNIQUENESS(?)`, binds: [CHECK_ID]});
+  mensaje = 'Task de tipo UNIQUENESS creada';
+
+} else if (check_type === 'CONSISTENCY') {
+  snowflake.execute({sqlText: `CALL CREATE_TASK_CONSISTENCY(?)`, binds: [CHECK_ID]});
+  mensaje = 'Task de tipo CONSISTENCY creada';
+
+} else {
+  mensaje = 'Tipo de check no soportado: ' + check_type;
+}
+
+return mensaje;
 $$;
+
 
 
 

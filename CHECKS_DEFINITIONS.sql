@@ -14,66 +14,76 @@
 
 CREATE OR REPLACE PROCEDURE CREATE_TASK_FRESHNESS(CHECK_ID STRING)
 RETURNS STRING
-LANGUAGE SQL
+LANGUAGE JAVASCRIPT
 AS
 $$
-DECLARE
-  target_schema STRING;
-  target_table STRING;
-  column_date STRING;
-  sla_minutes NUMBER;
-  schedule STRING;
-  task_sql STRING;
-  task_name STRING;
-BEGIN
-  -- Recuperar los parámetros necesarios desde la tabla de definición
-  SELECT TARGET_SCHEMA, TARGET_TABLE, COLUMNS_KEY, REFERENCE_VALUE, SCHEDULE
-  INTO target_schema, target_table, column_date, sla_minutes, schedule
-  FROM CONTROL_DEFINITIONS
-  WHERE CHECK_ID = :CHECK_ID;
+var stmt = snowflake.createStatement({
+  sqlText: `
+    SELECT TARGET_SCHEMA, TARGET_TABLE, COLUMNS_KEY, REFERENCE_VALUE, SCHEDULE, WHERE_CLAUSE
+    FROM CONTROL_DEFINITIONS
+    WHERE CHECK_ID = ?;
+  `,
+  binds: [CHECK_ID]
+});
 
-  -- Validación: si no hay columna de fecha definida, eliminar el check
-  IF column_date IS NULL OR TRIM(column_date) = '' THEN
-    CALL DROP_CHECK_PR(CHECK_ID);
-    RETURN 'ERROR: COLUMNS_KEY no está definida. El check fue eliminado automáticamente.';
-  END IF;
+var rs = stmt.execute();
+if (!rs.next()) {
+  return 'No se encontró el CHECK_ID: ' + CHECK_ID;
+}
 
-  -- Nombre de la task
-  LET task_name = 'TASK_' || CHECK_ID;
+var target_schema = rs.getColumnValue(1);
+var target_table = rs.getColumnValue(2);
+var column_date = rs.getColumnValue(3);
+var sla_minutes = rs.getColumnValue(4);
+var schedule = rs.getColumnValue(5);
+var where_clause = rs.getColumnValue(6);
 
-  -- Generar el SQL dinámico para crear la task
-  LET task_sql = '
-    CREATE OR REPLACE TASK IDENTIFIER(:1)
-    WAREHOUSE = TFG_F1_WH
-    SCHEDULE = ''' || schedule || '''
-    AS
-    INSERT INTO CONTROL_RESULTS (
-      CHECK_ID, CHECK_NAME, CHECK_TYPE, RESULT, DETAILS, EXECUTED_AT
-    )
-    SELECT
-      ''' || CHECK_ID || ''',
-      ''' || task_name || ''',
-      ''FRESHNESS'',
-      CASE
-        WHEN MAX(' || column_date || ') >= CURRENT_TIMESTAMP - INTERVAL ' || sla_minutes || ' MINUTE
-        THEN ''OK''
-        ELSE ''KO''
-      END,
-      OBJECT_CONSTRUCT(
-        ''MAX_DATE'', MAX(' || column_date || '),
-        ''SLA_MINUTES'', ' || sla_minutes || ',
-        ''TOTAL_ROWS'', COUNT(*)
-      ),
-      CURRENT_TIMESTAMP
-    FROM ' || target_schema || '.' || target_table || ';
-  ';
+if (!column_date || column_date.trim() === '') {
+  snowflake.execute({
+    sqlText: `CALL DROP_CHECK_PR(?)`,
+    binds: [CHECK_ID]
+  });
+  return 'ERROR: COLUMNS_KEY no está definida. El check fue eliminado automáticamente.';
+}
 
-  -- Ejecutar la creación de la task
-  EXECUTE IMMEDIATE :task_sql USING task_name;
+var task_name = 'TASK_' + CHECK_ID;
+var where_sql = (where_clause && where_clause.trim() !== '') ? `WHERE ${where_clause}` : '';
 
-  RETURN 'Task FRESHNESS creada con éxito';
-END;
+var task_sql = `
+  CREATE OR REPLACE TASK IDENTIFIER(?)
+  WAREHOUSE = TFG_F1_WH
+  SCHEDULE = '${schedule}'
+  AS
+  INSERT INTO CONTROL_RESULTS (
+    CHECK_ID, CHECK_NAME, CHECK_TYPE, RESULT, DETAILS, EXECUTED_AT
+  )
+  SELECT
+    '${CHECK_ID}',
+    '${task_name}',
+    'FRESHNESS',
+    CASE
+      WHEN MAX(${column_date}) >= CURRENT_TIMESTAMP - INTERVAL ${sla_minutes} MINUTE
+      THEN 'OK'
+      ELSE 'KO'
+    END,
+    OBJECT_CONSTRUCT(
+      'MAX_DATE', MAX(${column_date}),
+      'SLA_MINUTES', ${sla_minutes},
+      'TOTAL_ROWS', COUNT(*)
+    ),
+    CURRENT_TIMESTAMP
+  FROM ${target_schema}.${target_table}
+  ${where_sql};
+`;
+
+snowflake.createStatement({
+  sqlText: task_sql,
+  binds: [task_name]
+}).execute();
+
+return 'Task FRESHNESS creada con éxito';
 $$;
+
 
 
 -- ===================================================================================
@@ -92,67 +102,188 @@ $$;
 
 CREATE OR REPLACE PROCEDURE CREATE_TASK_UNIQUENESS(CHECK_ID STRING)
 RETURNS STRING
-LANGUAGE SQL
+LANGUAGE JAVASCRIPT
 AS
 $$
-DECLARE
-  target_schema STRING;
-  target_table STRING;
-  columns_key STRING;
-  schedule STRING;
-  task_name STRING;
-  task_sql STRING;
-BEGIN
-  -- Obtener parámetros necesarios
-  SELECT TARGET_SCHEMA, TARGET_TABLE, COLUMNS_KEY, SCHEDULE
-  INTO target_schema, target_table, columns_key, schedule
-  FROM CONTROL_DEFINITIONS
-  WHERE CHECK_ID = :CHECK_ID;
+var stmt = snowflake.createStatement({
+  sqlText: `
+    SELECT TARGET_SCHEMA, TARGET_TABLE, COLUMNS_KEY, SCHEDULE, WHERE_CLAUSE
+    FROM CONTROL_DEFINITIONS
+    WHERE CHECK_ID = ?;
+  `,
+  binds: [CHECK_ID]
+});
 
-  -- Validar que COLUMNS_KEY no esté vacío
-  IF columns_key IS NULL OR TRIM(columns_key) = '' THEN
-    -- Si no hay columnas clave, eliminar el control
-    CALL DROP_CHECK_PR(CHECK_ID);
-    RETURN 'Control eliminado: COLUMNS_KEY vacío.';
-  END IF;
+var rs = stmt.execute();
+if (!rs.next()) {
+  return 'No se encontró el CHECK_ID: ' + CHECK_ID;
+}
 
-  -- Nombre de la task
-  LET task_name = 'TASK_' || CHECK_ID;
+var target_schema = rs.getColumnValue(1);
+var target_table = rs.getColumnValue(2);
+var columns_key = rs.getColumnValue(3);
+var schedule = rs.getColumnValue(4);
+var where_clause = rs.getColumnValue(5);
 
-  -- Generar SQL dinámico de creación de la task
-  LET task_sql = '
-    CREATE OR REPLACE TASK IDENTIFIER(:1)
-    WAREHOUSE = TFG_F1_WH
-    SCHEDULE = ''' || schedule || '''
-    AS
-    WITH DUPLICADOS AS (
-      SELECT ' || columns_key || ', COUNT(*) AS NUM_DUPLICADOS
-      FROM ' || target_schema || '.' || target_table || '
-      GROUP BY ' || columns_key || '
-      HAVING COUNT(*) > 1
-    )
-    INSERT INTO CONTROL_RESULTS (
-      CHECK_ID, CHECK_NAME, CHECK_TYPE, RESULT, DETAILS, EXECUTED_AT
-    )
-    SELECT
-      ''' || CHECK_ID || ''',
-      ''' || task_name || ''',
-      ''UNIQUENESS'',
-      CASE WHEN COUNT(*) = 0 THEN ''OK'' ELSE ''KO'' END,
-      OBJECT_CONSTRUCT(
-        ''NUM_DUPLICADOS'', COUNT(*),
-        ''CLAVES'', ''' || columns_key || ''',
-        ''TOTAL_ROWS'', (SELECT COUNT(*) FROM ' || target_schema || '.' || target_table || ')
+if (!columns_key || columns_key.trim() === '') {
+  snowflake.execute({
+    sqlText: `CALL DROP_CHECK_PR(?)`,
+    binds: [CHECK_ID]
+  });
+  return 'Control eliminado: COLUMNS_KEY vacío.';
+}
 
-      ),
-      CURRENT_TIMESTAMP
-    FROM DUPLICADOS;
-  ';
+var task_name = 'TASK_' + CHECK_ID;
+var where_sql = (where_clause && where_clause.trim() !== '') ? `WHERE ${where_clause}` : '';
 
-  -- Ejecutar la creación de la task
-  EXECUTE IMMEDIATE :task_sql USING task_name;
+var task_sql = `
+  CREATE OR REPLACE TASK IDENTIFIER(?)
+  WAREHOUSE = TFG_F1_WH
+  SCHEDULE = '${schedule}'
+  AS
+  WITH DUPLICADOS AS (
+    SELECT ${columns_key}, COUNT(*) AS NUM_DUPLICADOS
+    FROM ${target_schema}.${target_table}
+    ${where_sql}
+    GROUP BY ${columns_key}
+    HAVING COUNT(*) > 1
+  )
+  INSERT INTO CONTROL_RESULTS (
+    CHECK_ID, CHECK_NAME, CHECK_TYPE, RESULT, DETAILS, EXECUTED_AT
+  )
+  SELECT
+    '${CHECK_ID}',
+    '${task_name}',
+    'UNIQUENESS',
+    CASE WHEN COUNT(*) = 0 THEN 'OK' ELSE 'KO' END,
+    OBJECT_CONSTRUCT(
+      'NUM_DUPLICADOS', COUNT(*),
+      'CLAVES', '${columns_key}',
+      'TOTAL_ROWS', (SELECT COUNT(*) FROM ${target_schema}.${target_table} ${where_sql})
+    ),
+    CURRENT_TIMESTAMP
+  FROM DUPLICADOS;
+`;
 
-  RETURN '✅ Task UNIQUENESS creada con éxito';
-END;
+snowflake.createStatement({
+  sqlText: task_sql,
+  binds: [task_name]
+}).execute();
+
+return 'Task UNIQUENESS creada con éxito';
 $$;
 
+
+-- ===================================================================================
+-- PROCEDURE: CONSISTENCY
+-- Este procedimiento compara los resultados de dos consultas (SOURCE y TARGET),
+-- identificando claves que estén solo en una de ellas, según los campos definidos
+-- en KEY_FIELDS. Permite ejecutar múltiples iteraciones con parámetros dinámicos.
+--
+-- Parámetros:
+-- SOURCE_QUERY     : STRING, consulta SQL parametrizable para el origen
+-- TARGET_QUERY     : STRING, consulta SQL parametrizable para el destino
+-- KEY_FIELDS       : STRING, lista de campos clave para el JOIN (separados por comas)
+-- PARAMS           : STRING, JSON con los valores a sustituir en las queries
+--
+-- Resultado:
+-- Tabla con una columna REASON (OBJECT con errores y metadatos) y RESULT (OK o KO)
+-- ===================================================================================
+CREATE OR REPLACE PROCEDURE CREATE_TASK_CONSISTENCY(CHECK_ID STRING)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+var stmt = snowflake.createStatement({
+  sqlText: `
+    SELECT CONSISTENCY_SOURCE_QUERY, CONSISTENCY_TARGET_QUERY, THRESHOLD_DIFF, SCHEDULE
+    FROM CONTROL_DEFINITIONS
+    WHERE CHECK_ID = ?;
+  `,
+  binds: [CHECK_ID]
+});
+
+var rs = stmt.execute();
+if (!rs.next()) {
+  return 'No se encontró el CHECK_ID: ' + CHECK_ID;
+}
+
+var source_query = rs.getColumnValue(1);
+var target_query = rs.getColumnValue(2);
+var threshold = rs.getColumnValue(3);
+var schedule = rs.getColumnValue(4);
+
+if (!source_query || !target_query) {
+  return 'ERROR: Se requieren CONSISTENCY_SOURCE_QUERY y CONSISTENCY_TARGET_QUERY definidos.';
+}
+
+if (!threshold || threshold <= 0) {
+  threshold = 0.01; // Valor por defecto del 1% si no se define
+}
+
+var task_name = 'TASK_' + CHECK_ID;
+
+// Plantilla SQL de la task
+var task_sql = `
+  CREATE OR REPLACE TASK IDENTIFIER(?)
+  WAREHOUSE = TFG_F1_WH
+  SCHEDULE = '${schedule}'
+  AS
+  WITH
+  SOURCE AS (${source_query}),
+  TARGET AS (${target_query}),
+  DIF AS (
+    SELECT
+      ${buildComparisonBlock()}
+    FROM SOURCE, TARGET
+  )
+  INSERT INTO CONTROL_RESULTS (
+    CHECK_ID, CHECK_NAME, CHECK_TYPE, RESULT, DETAILS, EXECUTED_AT
+  )
+  SELECT
+    '${CHECK_ID}',
+    '${task_name}',
+    'CONSISTENCY',
+    CASE WHEN EXISTS (
+      SELECT * FROM DIF WHERE ABS(REL_DIFF) > ${threshold}
+    ) THEN 'KO' ELSE 'OK' END,
+    OBJECT_AGG(METRIC, OBJECT_CONSTRUCT(
+      'SOURCE_VALUE', SRC_VAL,
+      'TARGET_VALUE', TRGT_VAL,
+      'REL_DIFF', REL_DIFF
+    )),
+    CURRENT_TIMESTAMP
+  FROM DIF;
+`;
+
+// Función auxiliar inline para generar la lógica de comparación genérica
+function buildComparisonBlock() {
+  return `
+    COLUMN_NAME AS METRIC,
+    SRC_VAL,
+    TRGT_VAL,
+    CASE
+      WHEN SRC_VAL = 0 AND TRGT_VAL = 0 THEN 0
+      WHEN SRC_VAL = 0 OR TRGT_VAL = 0 THEN 1
+      ELSE ABS(SRC_VAL - TRGT_VAL) / NULLIF(ABS(SRC_VAL), 0)
+    END AS REL_DIFF
+    FROM (
+      SELECT
+        COLUMN_NAME,
+        TO_NUMBER(SRC.VALUE) AS SRC_VAL,
+        TO_NUMBER(TRGT.VALUE) AS TRGT_VAL
+      FROM
+        LATERAL FLATTEN(INPUT => OBJECT_CONSTRUCT(*)) SRC,
+        LATERAL FLATTEN(INPUT => OBJECT_CONSTRUCT(*)) TRGT
+      WHERE SRC.KEY = TRGT.KEY
+    )
+  `;
+}
+
+snowflake.createStatement({
+  sqlText: task_sql,
+  binds: [task_name]
+}).execute();
+
+return 'Task CONSISTENCY creada con éxito';
+$$;
