@@ -134,7 +134,7 @@ if (!columns_key || columns_key.trim() === '') {
 }
 
 var task_name = 'TASK_' + CHECK_ID;
-var where_sql = (where_clause && where_clause.trim() !== '') ? `WHERE ${where_clause}` : '';
+var    = (where_clause && where_clause.trim() !== '') ? `WHERE ${where_clause}` : '';
 
 var task_sql = `
   CREATE OR REPLACE TASK IDENTIFIER(?)

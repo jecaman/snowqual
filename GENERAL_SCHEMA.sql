@@ -78,7 +78,13 @@ RETURNS STRING
 LANGUAGE JAVASCRIPT
 AS
 $$
-var stream_sql = `SELECT * FROM CONTROL_DEFINITIONS_CHANGES_STREAM`;
+var createTempTable = snowflake.createStatement({
+  sqlText: `CREATE OR REPLACE TEMPORARY TABLE CONTROL_DEFINITION_CHANGES_BUFFER AS
+            SELECT * FROM CONTROL_DEFINITIONS_CHANGES_STREAM`
+});
+createTempTable.execute();
+
+var stream_sql = `SELECT * FROM CONTROL_DEFINITION_CHANGES_BUFFER`;
 var stmt = snowflake.createStatement({sqlText: stream_sql});
 var rs = stmt.execute();
 
@@ -104,6 +110,7 @@ while (rs.next()) {
 
 return "Cambios procesados correctamente";
 $$;
+
 
 
 -- ===================================================================================
